@@ -2362,7 +2362,9 @@ static int try_read_fast_index(struct index_state *istate, const char *path)
 		free(cache_array_cache);
 		cache_array_cache = NULL;
 		ALLOC_ARRAY(istate->cache, istate->cache_alloc);
+#ifdef MADV_HUGEPAGE
 		madvise(istate->cache, (size_t)istate->cache_alloc * sizeof(struct cache_entry *), MADV_HUGEPAGE);
+#endif
 	}
 
 	/*
