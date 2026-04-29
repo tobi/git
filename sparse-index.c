@@ -674,6 +674,9 @@ void clear_skip_worktree_from_present_files(struct index_state *istate)
 {
 	struct repo_config_values *cfg = repo_config_values(the_repository);
 
+	if (istate->skip_worktree_already_cleared)
+		return;
+
 	if (!cfg->apply_sparse_checkout ||
 	    sparse_expect_files_outside_of_patterns)
 		return;

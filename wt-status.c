@@ -27,6 +27,7 @@
 #include "read-cache.h"
 #include "setup.h"
 #include "strbuf.h"
+#include "tree-cache-sidecar.h"
 #include "trace.h"
 #include "trace2.h"
 #include "tree.h"
@@ -668,6 +669,25 @@ static void wt_status_collect_changes_index(struct wt_status *s)
 	struct rev_info rev;
 	struct setup_revision_opt opt;
 
+	/*
+	 * Fast path: if we have a fresh HEAD tree sidecar, use it to
+	 * check for staged changes without decompressing tree objects.
+	 * Only works for the common case (no initial commit, default ref).
+	 */
+	if (!s->is_initial && s->repo->index->cache_nr > 0) {
+		struct object_id head_oid;
+		if (!repo_get_oid(s->repo, s->reference ? s->reference : "HEAD", &head_oid)) {
+			int fast_result = try_fast_diff_cached(
+				s->repo->index, &head_oid, NULL, NULL);
+			if (fast_result == 0) {
+				/* Clean! No staged changes. Skip traverse_trees. */
+				return;
+			}
+			/* fast_result > 0 means changes exist, fall through to normal path */
+			/* fast_result < 0 means sidecar stale, fall through */
+		}
+	}
+
 	repo_init_revisions(s->repo, &rev, NULL);
 	memset(&opt, 0, sizeof(opt));
 	opt.def = s->is_initial ? empty_tree_oid_hex(s->repo->hash_algo) : s->reference;
@@ -874,6 +894,21 @@ void wt_status_collect(struct wt_status *s)
 		trace2_region_enter("status", "index", s->repo);
 		wt_status_collect_changes_index(s);
 		trace2_region_leave("status", "index", s->repo);
+
+		/*
+		 * Generate tree sidecar for next run, but only if the existing
+		 * one is stale (HEAD mismatch) AND we don't have a valid cache_tree
+		 * (which makes traverse_trees fast anyway).
+		 */
+		if (!s->is_initial && !s->repo->index->cache_tree) {
+			struct object_id head_oid;
+			if (!repo_get_oid(s->repo, "HEAD", &head_oid)) {
+				struct commit *c = lookup_commit_reference(s->repo, &head_oid);
+				if (c && !repo_parse_commit(s->repo, c))
+					write_head_tree_sidecar(s->repo->index,
+						&head_oid, get_commit_tree_oid(c));
+			}
+		}
 	}
 
 	trace2_region_enter("status", "untracked", s->repo);

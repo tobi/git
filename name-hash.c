@@ -122,7 +122,14 @@ static void hash_index_entry(struct index_state *istate, struct cache_entry *ce)
 	ce->ce_flags |= CE_HASHED;
 
 	if (!S_ISSPARSEDIR(ce->ce_mode)) {
-		hashmap_entry_init(&ce->ent, memihash(ce->name, ce_namelen(ce)));
+		/*
+		 * If ent.hash is already set (pre-computed in the fast index
+		 * sidecar), skip the expensive memihash computation.
+		 */
+		if (!ce->ent.hash)
+			hashmap_entry_init(&ce->ent, memihash(ce->name, ce_namelen(ce)));
+		else
+			hashmap_entry_init(&ce->ent, ce->ent.hash);
 		hashmap_add(&istate->name_hash, &ce->ent);
 	}
 
