@@ -2399,7 +2399,9 @@ static int try_read_fast_index(struct index_state *istate, const char *path)
 	oidread(&istate->oid, fhdr->index_checksum, the_repository->hash_algo);
 	istate->sparse_index = fhdr->sparse_index;
 	istate->skip_worktree_already_cleared = 1; /* sidecar was written post-clear */
-	istate->fsmonitor_has_run_once = 1; /* FSMN skipped, no fsmonitor state to process */
+	/* fsmonitor_has_run_once intentionally NOT set: we want post_read_index_from
+	 * to run tweak_fsmonitor() so the fsmonitor IPC daemon (if configured) is
+	 * actually used — otherwise status falls back to a full recursive readdir. */
 	istate->initialized = 1;
 
 	/*
@@ -2411,9 +2413,12 @@ static int try_read_fast_index(struct index_state *istate, const char *path)
 		if (ext_fd >= 0) {
 			size_t idx_size = fhdr->index_file_size;
 			int hashsz = the_hash_algo->rawsz;
-			/* Only mmap the extension region (11MB) instead of full index (237MB) */
+			/* Only mmap the extension region (~10MB) instead of full index (~240MB).
+			 * mmap offset must be aligned to the system page size; Apple Silicon
+			 * uses 16 KB pages, x86_64/Linux uses 4 KB. Use sysconf to be safe. */
 			size_t ext_file_offset = fhdr->extension_offset;
-			size_t page_size = 4096;
+			long _ps = sysconf(_SC_PAGESIZE);
+			size_t page_size = (_ps > 0) ? (size_t)_ps : 4096;
 			size_t aligned_offset = (ext_file_offset / page_size) * page_size;
 			size_t ext_region_size = idx_size - aligned_offset;
 			const char *ext_mmap = xmmap_gently(NULL, ext_region_size,
@@ -2422,19 +2427,14 @@ static int try_read_fast_index(struct index_state *istate, const char *path)
 			if (ext_mmap != MAP_FAILED) {
 				size_t intra_page = ext_file_offset - aligned_offset;
 				const char *ext_start = ext_mmap + intra_page;
-				const char *ext_end = ext_mmap + ext_region_size - hashsz +
-					(aligned_offset > 0 ? 0 : 0);
 				/* ext_end = position of trailing checksum in the mmap */
-				ext_end = ext_mmap + (idx_size - hashsz - aligned_offset);
+				const char *ext_end = ext_mmap + (idx_size - hashsz - aligned_offset);
 				while (ext_start < ext_end) {
 					uint32_t ext_sz = get_be32(ext_start + 4);
 					if (ext_start + 8 + ext_sz > ext_end)
 						break;
-					/* Skip FSMN extension — fsmonitor not available */
-					if (ext_start[0] != 'F' || ext_start[1] != 'S' ||
-					    ext_start[2] != 'M' || ext_start[3] != 'N')
-						read_index_extension(istate, ext_start,
-								ext_start + 8, ext_sz);
+					read_index_extension(istate, ext_start,
+							ext_start + 8, ext_sz);
 					ext_start += 8 + ext_sz;
 				}
 				munmap((void *)ext_mmap, ext_region_size);
@@ -2766,14 +2766,19 @@ int read_index_from(struct index_state *istate, const char *path,
 	split_index = istate->split_index;
 	if (!split_index || is_null_oid(&split_index->base_oid)) {
 		/*
-		 * Skip post-read tweaks when loaded via fast sidecar:
-		 * - check_ce_order: sidecar preserves original order
-		 * - tweak_untracked_cache: extensions loaded separately
-		 * - tweak_split_index: sidecar is never split
-		 * - tweak_fsmonitor: FSMN skipped, has_run_once set
+		 * When loaded via fast sidecar we can skip check_ce_order
+		 * (sidecar preserves order) and tweak_split_index (sidecar
+		 * is never split). We MUST still wire up untracked-cache
+		 * and fsmonitor — repos that use them rely on UNTR/FSM
+		 * being attached to istate or status falls back to a full
+		 * recursive readdir.
 		 */
-		if (!istate->fsmonitor_has_run_once)
+		if (istate->fsmonitor_has_run_once) {
+			tweak_untracked_cache(istate);
+			tweak_fsmonitor(istate);
+		} else {
 			post_read_index_from(istate);
+		}
 		return ret;
 	}
 
