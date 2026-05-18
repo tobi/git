@@ -176,7 +176,8 @@ struct index_state {
 		 drop_cache_tree : 1,
 		 updated_workdir : 1,
 		 updated_skipworktree : 1,
-		 fsmonitor_has_run_once : 1;
+		 fsmonitor_has_run_once : 1,
+		 skip_worktree_already_cleared : 1;
 	enum sparse_index_mode sparse_index;
 	struct hashmap name_hash;
 	struct hashmap dir_hash;
@@ -185,6 +186,8 @@ struct index_state {
 	char *fsmonitor_last_update;
 	struct ewah_bitmap *fsmonitor_dirty;
 	struct mem_pool *ce_mem_pool;
+	char *fast_index_mmap;
+	size_t fast_index_mmap_size;
 	struct progress *progress;
 	struct repository *repo;
 	struct pattern_list *sparse_checkout_patterns;

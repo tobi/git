@@ -26,7 +26,7 @@
  * to have at least 500 lstat's per thread for it to
  * be worth starting a thread.
  */
-#define MAX_PARALLEL (20)
+#define MAX_PARALLEL (64)
 #define THREAD_COST (500)
 
 struct progress_data {

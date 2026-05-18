@@ -461,6 +461,7 @@ int repo_read_index(struct repository *repo)
 
 	res = read_index_from(repo->index, repo->index_file, repo->gitdir);
 
+	trace2_region_enter("index", "post_read_setup", repo);
 	prepare_repo_settings(repo);
 	if (repo->settings.command_requires_full_index)
 		ensure_full_index(repo->index);
@@ -471,6 +472,7 @@ int repo_read_index(struct repository *repo)
 	 * clear that attribute for that path.
 	 */
 	clear_skip_worktree_from_present_files(repo->index);
+	trace2_region_leave("index", "post_read_setup", repo);
 
 	return res;
 }

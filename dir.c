@@ -36,6 +36,8 @@
 #include "trace2.h"
 #include "tree.h"
 #include "hex.h"
+#include "thread-utils.h"
+#include <pthread.h>
 
  /*
   * The maximum size of a pattern/exclude file. If the file exceeds this size
@@ -2532,6 +2534,13 @@ static int valid_cached_dir(struct dir_struct *dir,
 		return 0;
 
 	/*
+	 * If pre-validated by parallel pass, recurse==1 means dir is valid.
+	 * We still need prep_exclude for exclude stack state maintenance.
+	 */
+	if (untracked->recurse && untracked->valid)
+		goto check_only_and_exclude;
+
+	/*
 	 * With fsmonitor, we can trust the untracked cache's valid field.
 	 */
 	refresh_fsmonitor(istate);
@@ -2547,6 +2556,7 @@ static int valid_cached_dir(struct dir_struct *dir,
 		}
 	}
 
+check_only_and_exclude:
 	if (untracked->check_only != !!check_only)
 		return 0;
 
@@ -3132,6 +3142,130 @@ static void emit_traversal_statistics(struct dir_struct *dir,
 			   "opendir", dir->untracked->dir_opened);
 }
 
+/*
+ * Parallel pre-validation of untracked cache directories.
+ * Collects all directory paths from the cache tree, lstats them
+ * in parallel, and stores results back.
+ */
+struct prevalidate_entry {
+	struct untracked_cache_dir *ucd;
+	char *path;
+	struct stat st;
+	int stat_valid;
+};
+
+struct prevalidate_data {
+	struct prevalidate_entry *entries;
+	int start, end;
+};
+
+static void collect_untracked_dirs(struct untracked_cache_dir *ucd,
+				   struct strbuf *base,
+				   struct prevalidate_entry **entries,
+				   int *nr, int *alloc)
+{
+	unsigned int i;
+	size_t base_len = base->len;
+
+	if (*nr >= *alloc) {
+		*alloc = (*alloc) ? (*alloc) * 2 : 1024;
+		REALLOC_ARRAY(*entries, *alloc);
+	}
+	(*entries)[*nr].ucd = ucd;
+	(*entries)[*nr].path = base->len ? xstrdup(base->buf) : xstrdup(".");
+	(*entries)[*nr].stat_valid = 0;
+	(*nr)++;
+
+	for (i = 0; i < ucd->dirs_nr; i++) {
+		strbuf_addstr(base, ucd->dirs[i]->name);
+		strbuf_addch(base, '/');
+		collect_untracked_dirs(ucd->dirs[i], base, entries, nr, alloc);
+		strbuf_setlen(base, base_len);
+	}
+}
+
+static void *prevalidate_thread(void *arg)
+{
+	struct prevalidate_data *d = arg;
+	int i;
+	for (i = d->start; i < d->end; i++) {
+		if (lstat(d->entries[i].path, &d->entries[i].st) == 0)
+			d->entries[i].stat_valid = 1;
+	}
+	return NULL;
+}
+
+static int prevalidate_untracked_cache(struct untracked_cache_dir *root,
+					struct index_state *istate)
+{
+	struct prevalidate_entry *entries = NULL;
+	int nr = 0, alloc = 0;
+	struct strbuf base = STRBUF_INIT;
+	int i, num_threads, per_thread;
+	pthread_t *threads;
+	struct prevalidate_data *thread_data;
+	int all_valid = 1;
+
+	if (!root)
+		return 0;
+
+	collect_untracked_dirs(root, &base, &entries, &nr, &alloc);
+	strbuf_release(&base);
+
+	if (nr < 100) {
+		for (i = 0; i < nr; i++)
+			free(entries[i].path);
+		free(entries);
+		return 0;
+	}
+
+	num_threads = nr / 500;
+	if (num_threads < 2) num_threads = 2;
+	if (num_threads > 64) num_threads = 64;
+
+	threads = xcalloc(num_threads, sizeof(pthread_t));
+	thread_data = xcalloc(num_threads, sizeof(struct prevalidate_data));
+	per_thread = (nr + num_threads - 1) / num_threads;
+
+	for (i = 0; i < num_threads; i++) {
+		thread_data[i].entries = entries;
+		thread_data[i].start = i * per_thread;
+		thread_data[i].end = (i + 1) * per_thread;
+		if (thread_data[i].end > nr)
+			thread_data[i].end = nr;
+		pthread_create(&threads[i], NULL, prevalidate_thread, &thread_data[i]);
+	}
+	for (i = 0; i < num_threads; i++)
+		pthread_join(threads[i], NULL);
+
+	/* Store results — mark pre-validated dirs */
+	for (i = 0; i < nr; i++) {
+		struct prevalidate_entry *e = &entries[i];
+		if (e->stat_valid) {
+			if (e->ucd->valid &&
+			    !match_stat_data_racy(istate, &e->ucd->stat_data, &e->st)) {
+				/* Dir unchanged — mark as pre-validated (recurse=1 reused) */
+				e->ucd->recurse = 1;
+			} else {
+				fill_stat_data(&e->ucd->stat_data, &e->st);
+				e->ucd->valid = 0;
+				e->ucd->recurse = 0;
+				all_valid = 0;
+			}
+		} else {
+			memset(&e->ucd->stat_data, 0, sizeof(e->ucd->stat_data));
+			e->ucd->valid = 0;
+			e->ucd->recurse = 0;
+			all_valid = 0;
+		}
+		free(e->path);
+	}
+	free(entries);
+	free(threads);
+	free(thread_data);
+	return all_valid;
+}
+
 int read_directory(struct dir_struct *dir, struct index_state *istate,
 		   const char *path, int len, const struct pathspec *pathspec)
 {
@@ -3153,6 +3287,14 @@ int read_directory(struct dir_struct *dir, struct index_state *istate,
 		 * e.g. prep_exclude()
 		 */
 		dir->untracked = NULL;
+
+	/* Parallel pre-validation of directory stats */
+	if (untracked) {
+		trace2_region_enter("dir", "prevalidate_dirs", istate->repo);
+		prevalidate_untracked_cache(untracked, istate);
+		trace2_region_leave("dir", "prevalidate_dirs", istate->repo);
+	}
+
 	if (!len || treat_leading_path(dir, istate, path, len, pathspec))
 		read_directory_recursive(dir, istate, path, len, untracked, 0, 0, pathspec);
 	QSORT(dir->entries, dir->nr, cmp_dir_entry);
